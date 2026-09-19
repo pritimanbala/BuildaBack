@@ -43,7 +43,7 @@ class Query:
 @strawberry.type
 class Mutation:
     @strawberry.mutation
-    def sign_up(self, info, email: str, password: str, name: str | None = None, role: str = "EXE") -> UserType:
+    def sign_up(self, info: Info, email: str, password: str, name: str | None = None, role: str = "EXE") -> UserType:
         if len(password) < 8:
             raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
         if role not in {"ADMIN", "EXE"}:
@@ -59,7 +59,7 @@ class Mutation:
             return as_type(user)
 
     @strawberry.mutation
-    def sign_in(self, info, email: str, password: str) -> UserType:
+    def sign_in(self, info: Info, email: str, password: str) -> UserType:
         with SessionLocal() as db:
             user = db.scalar(select(User).where(User.email == email.lower()))
             if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
@@ -68,7 +68,7 @@ class Mutation:
             return as_type(user)
 
     @strawberry.mutation
-    def sign_out(self, info) -> bool:
+    def sign_out(self, info: Info) -> bool:
         clear_auth_cookie(info.context["response"])
         return True
 
