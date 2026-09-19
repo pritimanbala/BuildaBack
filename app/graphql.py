@@ -2,6 +2,7 @@ import strawberry
 from fastapi import HTTPException, Request, Response
 from sqlalchemy import select
 from .database import SessionLocal
+from strawberry.types import Info
 from .models import User
 from .security import clear_auth_cookie, get_user_id_from_request, hash_password, set_auth_cookie, verify_password
 
@@ -21,18 +22,23 @@ def as_type(user: User) -> UserType:
 async def get_context(request: Request, response: Response):
     return {"request": request, "response": response}
 
-
 @strawberry.type
 class Query:
+
     @strawberry.field
-    def me(self, info) -> UserType:
+    def me(self, info: Info) -> UserType:
         user_id = get_user_id_from_request(info.context["request"])
+
         with SessionLocal() as db:
             user = db.get(User, user_id)
-            if not user:
-                raise HTTPException(status_code=401, detail="Not authenticated")
-            return as_type(user)
 
+            if not user:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Not authenticated"
+                )
+
+            return as_type(user)
 
 @strawberry.type
 class Mutation:
