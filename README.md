@@ -2,6 +2,9 @@
 
 FastAPI authentication service backed by PostgreSQL. It supports email/password signup and signin, JWTs stored in HttpOnly cookies, Google OAuth, and GraphQL.
 
+> **📖 This README is organized in two parts:**
+> **Part 1 — Software** (backend, database, API) and **Part 2 — AI Agents** (the autonomous SDR agent layer). Scroll to the **⚙️ ➜ 🧠 From Software to Intelligence** divider below to jump straight to the AI section.
+
 ## Setup
 
 1. Create a PostgreSQL database (e.g. on **Neon** serverless Postgres or local PostgreSQL), then copy `.env.example` to `.env` and replace every placeholder.
@@ -308,4 +311,3 @@ Every agent above runs through the same four non-negotiable checks before anythi
 *Six agents. One pipeline. Zero hallucinations. A full sales cycle, run autonomously.*
 
 </div>
-
