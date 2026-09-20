@@ -16,7 +16,7 @@ class UserType:
 
 
 def as_type(user: User) -> UserType:
-    return UserType(id=str(user.id), email=user.email, name=user.name, role=user.role)
+    return UserType(id=str(user.id), email=user.email, name=user.name, role=user.role) # type: ignore
 
 
 async def get_context(request: Request, response: Response):
@@ -46,8 +46,8 @@ class Mutation:
     def sign_up(self, info: Info, email: str, password: str, name: str | None = None, role: str = "EXE") -> UserType:
         if len(password) < 8:
             raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
-        if role not in {"ADMIN", "EXE"}:
-            raise HTTPException(status_code=422, detail="Role must be ADMIN or EXE")
+        if role not in {"ADMIN", "EXE", "EXECUTIVE"}:
+            raise HTTPException(status_code=422, detail="Role must be ADMIN, EXE, or EXECUTIVE")
         with SessionLocal() as db:
             if db.scalar(select(User).where(User.email == email.lower())):
                 raise HTTPException(status_code=409, detail="Email is already registered")

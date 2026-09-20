@@ -24,7 +24,12 @@ def create_access_token(user_id: UUID) -> str:
 
 
 def get_user_id_from_request(request: Request) -> UUID:
-    token = request.cookies.get(COOKIE_NAME)
+    token = None
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = request.cookies.get(COOKIE_NAME)
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
