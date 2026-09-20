@@ -144,3 +144,168 @@ Other operations: `signIn`, `signOut`, and `me`. GraphQL mutations also send the
 
 Create an OAuth 2.0 Web Application client and add the exact `GOOGLE_REDIRECT_URI` from `.env` (for local development: `http://localhost:8000/api/auth/google/callback`) as an authorized redirect URI. Place the client ID and secret in `.env`; never commit that file.
 
+
+
+
+
+---
+
+<div align="center">
+
+## ⚙️ ➜ 🧠 From Software to Intelligence
+
+**Everything above this line is the platform. Everything below is the brain.**
+
+The following section covers the **Autonomous AI Agent Layer** — the multi-agent system that turns the application above into a self-operating SDR: sourcing leads, scoring them, writing outreach, reading replies, and following up, without a human touching a keyboard.
+
+---
+
+## Agent Handbook
+
+For the full I/O contract of every agent — exact request/response JSON, webhook URLs, scoring rubrics, and the reasoning behind each design decision — see the complete reference document:
+
+**➡️ [Agent Handbook (PDF)](https://drive.google.com/file/d/1rjU5eD2KrHV9xSL7e-IVOnAnRF_usBjv/view?usp=sharing)**
+
+*If hosted in this repo instead of externally, use a relative path, e.g. `docs/Agent_Handbook.pdf`.*
+
+</div>
+
+---
+
+# AI Agent Layer — Autonomous SDR Intelligence
+
+## Why Multi-Agent, Not One Big Prompt?
+
+A single monolithic LLM call cannot reliably do lead scoring, outreach writing, reply triage, and follow-up cadence at once — the context, the failure modes, and the guardrails needed for each task are fundamentally different. So instead of one god-prompt, this layer is built as **six specialized agents**, each with a narrow job, its own prompt contract, its own JSON schema, and its own guardrails — chained together with **LangChain LCEL** so the output of one agent becomes verified, structured input for the next.
+
+This was a deliberate architectural choice:
+- **Narrow responsibility → higher accuracy.** A fitment-scoring prompt doesn't also have to know how to write a break-up email.
+- **Composable pipeline.** Any single agent can be swapped, re-prompted, or re-scored without touching the rest of the system.
+- **Debuggable & auditable.** Every agent emits structured JSON, so a failure is traceable to one exact stage, not buried inside a giant chain-of-thought.
+- **Grounded, not generative-for-generative's-sake.** Every agent that produces prospect-facing text is forced to pull from **Qdrant RAG** rather than the model's parametric memory — this is what makes the outreach *zero-hallucination* instead of just "sounds plausible."
+
+---
+
+## The Agent Pipeline, In Depth
+
+### 1️⃣ Company Discovery Agent — *Built on DronaHQ*
+
+**The problem it solves:** A user shouldn't have to manually go find 50 company websites that match "AI infra startups in the Bay Area." That's the single most tedious, low-leverage task in SDR work — so it's the first thing to automate.
+
+**How it works:** Takes a high-level, natural-language ICP query and decomposes it into targeted web searches, resolving real company domains rather than generic search snippets. It hands off a clean list of raw candidate URLs — no scoring, no judgment yet, just discovery — to keep this agent fast and cheap to run at scale.
+
+**Why it's a separate agent:** Discovery is a *breadth* problem (cast a wide net) while scoring is a *depth* problem (evaluate one company thoroughly). Merging them would force every discovery call to pay the token cost of deep evaluation.
+
+---
+
+### 2️⃣ ICP Fitment & Lead Scoring Agent — *Built with Langchain* (`fitment_agent.py`)
+
+**The problem it solves:** Not every company that shows up is worth pursuing. Someone has to *actually check the website* and decide — not guess.
+
+**How it works:**
+1. Receives raw domains + the user's ICP definition (geography, size, industry, tech stack, funding).
+2. **Live-scrapes the real website** (Trafilatura/HTTP) — this agent never scores off a name or a guess, it reads the actual page.
+3. Runs a **weighted 6-factor rubric** against the scraped content:
+
+| Criterion | Weight | What it's really checking |
+|---|---|---|
+| `Interest_of_user` | 25 pts | Does this company's stated focus actually match campaign intent? |
+| `Industry_filters` | 20 pts | Vertical match against required industries |
+| `Technology_requirements` | 20 pts | Detected tech stack / AI capability signals |
+| `Target_geography` | 15 pts | HQ / operational footprint |
+| `Company_size_range` | 10 pts | Headcount band |
+| `Revenue_or_funding_filters` | 10 pts | Funding stage / financial tier |
+
+4. Outputs a hard **0–100 score**, a boolean `meets_criteria` gate at **≥ 65**, a 1–2 sentence summary, and a written audit trail explaining *why* each sub-score landed where it did.
+
+**Why it's designed this way:** A binary yes/no from an LLM is a black box you can't trust or debug. A **weighted, auditable rubric** turns lead qualification into something a sales manager can actually inspect and tune — this agent is built to be *accountable*, not just "smart."
+
+---
+
+### 3️⃣ Contact Enrichment Agent — *the finder*
+
+**The problem it solves:** A qualified *company* isn't a lead — a qualified *person* is. This agent closes that gap.
+
+**How it works:** Inspects the qualified company's web presence for individuals holding the target persona (e.g. "VP of Engineering"), and extracts a structured contact payload — full name, title, work email, phone — ready to hand straight into outreach with zero manual lookup.
+
+**Why it's a separate agent:** Contact extraction requires a different scanning strategy (people/team pages, leadership bios) than fitment scoring does (product/pricing pages) — separating them keeps each agent's scraping and prompt focused on what it's actually looking for.
+
+---
+
+### 4️⃣ Autonomous Cold Outreach Agent — *the writer* (`outreach_agent.py`)
+
+**The problem it solves:** Generic outreach doesn't convert, and hallucinated outreach is worse — it burns trust and violates compliance. This agent has to be persuasive *and* provably grounded.
+
+**How it works:**
+- **Dynamic channel routing**: automatically picks the highest-signal channel available — `email → phone (SMS) → LinkedIn` — so no lead goes untouched just because one contact field is empty.
+- **Qdrant Campaign RAG**: before writing a single word, it queries the vector store for campaign-specific proof points, ROI metrics, and persona-matched case studies — so every claim in the message is retrievable, cited knowledge, not invention.
+- **Human-in-the-loop revision**: a rep can say "make this shorter" or "lead with the ROI stat" and the agent revises *without* losing prior context or violating guardrails — this was intentionally built so the AI augments a rep's judgment instead of replacing their final say.
+
+**Why it's designed this way:** This is the single highest-risk agent in the pipeline — it's the one actually talking to a real human prospect. It was built RAG-first specifically so the model is *structurally incapable* of fabricating a customer name or a fake statistic — it can only say what's in the knowledge base.
+
+---
+
+### 5️⃣ Inbound Reply & Decision Agent — *the listener* (`reply_agent.py`)
+
+**The problem it solves:** A prospect's reply carries intent, tone, and sometimes a legal obligation (opt-out) — treating every reply the same is both bad sales and a compliance risk.
+
+**How it works:** Classifies every inbound reply into one of five intents, then drafts an appropriate, context-aware counter-reply — never a generic template.
+
+| Intent | What triggers it |
+|---|---|
+| `MEETING_REQUEST` / `POSITIVE` | Interest expressed, or a meeting time proposed |
+| `OBJECTION` | Friction voiced — *"too expensive," "already using a competitor," "not right now"* |
+| `INFORMATION_REQUEST` | A technical or capability question |
+| `UNSUBSCRIBE_OPT_OUT` | An explicit removal request |
+| `NOT_INTERESTED` | A soft rejection, no explicit opt-out |
+
+Critically, `UNSUBSCRIBE_OPT_OUT` detection **automatically flags the contact for the CRM's Do-Not-Contact list and suppresses all further pitching** — this isn't a nice-to-have, it's a compliance guardrail baked directly into the intent classifier, not bolted on afterward.
+
+**Why it's designed this way:** Objection handling, meeting booking, and legal opt-out are three completely different downstream actions — routing them through one classifier first means the *right* action always happens automatically, with no chance of a human forgetting to update a suppression list.
+
+---
+
+### 6️⃣ Autonomous Follow-Up Cadence Agent — *the closer* (`followup_agent.py`)
+
+**The problem it solves:** Most follow-up sequences are the same email sent three times with a subject-line change — which is why prospects tune them out. A good SDR *advances the narrative* with every touch. So does this agent.
+
+**How it works — a genuine 3-stage narrative arc, not a repeat loop:**
+
+| Stage | Trigger | What actually happens |
+|---|---|---|
+| **1 · Gentle Nudge** | `followup_count: 0` | Acknowledges the prospect is busy, then pulls a **fresh** RAG proof point — one *not* present in the original message — and closes with a low-friction CTA |
+| **2 · Objection Reframe** | `followup_count: 1` | Proactively anticipates the *unvoiced* friction for that specific role (e.g. a VP Eng worries about implementation bandwidth) and reframes with customer proof data |
+| **3 · Break-Up** | `followup_count ≥ 2` | Respectfully closes the thread, removes all sales pressure, and leaves the door open for future contact |
+
+**Why it's designed this way:** Each stage queries Qdrant for a *different angle* of context, so the agent is structurally prevented from just re-sending the same pitch — the progression from nudge → reframe → break-up mirrors what a genuinely thoughtful human SDR does, and it's why leads don't go cold from repetition fatigue.
+
+---
+
+##  Guardrails Are Part of the Architecture, Not an Afterthought
+
+Every agent above runs through the same four non-negotiable checks before anything reaches a prospect:
+
+| ID | Guardrail | Why it exists |
+|---|---|---|
+| **G1** | Anti-Hallucination & Strict Grounding | Every claim must trace back to retrieved Qdrant context — this is what makes "zero-hallucination outreach" a real property of the system, not a marketing line |
+| **G2** | Tone & Anti-Cliché Filter | Programmatically bans SDR-spam phrases (*"I hope this email finds you well," "just following up," "synergy," "leverage"*) so messages read human, not templated |
+| **G3** | Zero Competitor Bashing | Prompts are structurally forbidden from naming or disparaging competitors — outreach stays value-prop focused, which is both better sales practice and lower legal risk |
+| **G4** | PII & Sensitive Data Redaction | Post-generation regex catches and masks SSNs and card numbers before anything is sent, as a last-line safety net |
+
+---
+
+## Why This Was Built on Groq + Qdrant + LangChain LCEL
+
+- **Groq** was chosen for inference speed — a multi-agent pipeline (discover → score → enrich → write → route → follow up) makes *many* sequential LLM calls per lead, and latency compounds fast. Groq keeps the whole chain fast enough to feel real-time.
+- **Multi-key failover (`groq_utils.py`)** was built because a live demo — or a live sales team — going down mid-pipeline because of a rate limit is unacceptable. `RunnableWithFallbacks` silently rotates across `GROQ_API_KEY1 → 2 → 3` with **zero lost state**.
+- **Qdrant + FastEmbed (`bge-small-en-v1.5`)** was chosen specifically because it runs **fully locally with no external embedding API key** — meaning the RAG grounding layer that every guardrail depends on has no external point of failure and no added cost per embedding call.
+- **LangChain LCEL** ties all six agents into one declarative, composable chain — so the system is genuinely a *pipeline*, not six disconnected scripts glued together with manual JSON parsing.
+
+---
+
+<div align="center">
+
+*Six agents. One pipeline. Zero hallucinations. A full sales cycle, run autonomously.*
+
+</div>
+
