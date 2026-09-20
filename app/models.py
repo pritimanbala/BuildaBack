@@ -154,6 +154,7 @@ class User(Base):
     google_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True)
     role: Mapped[UserRole] = mapped_column(sa_user_role, nullable=False, default=UserRole.EXECUTIVE, server_default="EXECUTIVE")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    admin_linked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     daily_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=50, server_default="50")
     working_hours: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     channel_access: Mapped[Optional[list[Channel]]] = mapped_column(ARRAY(sa_channel), nullable=True)
@@ -198,6 +199,14 @@ class User(Base):
     @isActive.setter
     def isActive(self, value: bool) -> None:
         self.is_active = value
+
+    @property
+    def adminLinked(self) -> bool:
+        return self.admin_linked
+
+    @adminLinked.setter
+    def adminLinked(self, value: bool) -> None:
+        self.admin_linked = value
 
     @property
     def dailyLimit(self) -> int:
@@ -689,3 +698,20 @@ class Evaluation(Base):
 
     # Relationships
     campaign: Mapped[Optional[Campaign]] = relationship("Campaign", back_populates="evaluations")
+
+
+class JoinRequest(Base):
+    __tablename__ = "join_requests"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, server_default=uuid_default)
+    user_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    code_entered: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING", server_default="PENDING", index=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=now_default)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by_id: Mapped[Optional[UUID]] = mapped_column(PostgreSQLUUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    # Relationships
+    user: Mapped[User] = relationship("User", foreign_keys=[user_id])
+    reviewed_by: Mapped[Optional[User]] = relationship("User", foreign_keys=[reviewed_by_id])

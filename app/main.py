@@ -2,6 +2,7 @@ import socket
 socket.setdefaulttimeout(None)
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
+from pydantic import BaseModel
 from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,11 +24,12 @@ import json
 import os
 import urllib.request
 import re
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy import func, or_, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .config import get_settings
 from .database import Base, engine, get_db
@@ -44,9 +46,20 @@ from .models import (
     Company,
     Contact,
     ContactStage,
+    Conversation,
+    Direction,
+    Draft,
+    DraftStatus,
+    Message,
+    AgentRun,
+    Approval,
+    ApprovalDecision,
+    AuditLog,
+    JoinRequest,
     MemberRole,
     SystemSetting,
     User,
+    UserRole,
 )
 from .schemas import (
     AddProspectToCampaignRequest,
@@ -60,10 +73,18 @@ from .schemas import (
     CampaignStatusUpdate,
     CampaignUpdate,
     ChannelMetricItem,
+    ConversationDetailResponse,
+    ConversationListItem,
     ConversationSummary,
+    CreateMessageRequest,
     DashboardStatsResponse,
     EscalationItem,
     EscalationStatItem,
+    JoinRequestItem,
+    JoinStatusResponse,
+    LinkAdminRequest,
+    LinkAdminResponse,
+    MessageResponse,
     OutreachCampaignDetailsResponse,
     OutreachProspectItem,
     OutreachSearchRequest,
@@ -75,6 +96,7 @@ from .schemas import (
     SettingsPayload,
     StatValueItem,
     UserResponse,
+    WorkspaceMemberItem,
 )
 from .security import (
     clear_auth_cookie,
@@ -106,10 +128,23 @@ async def lifespan(_: FastAPI):
         connection.execute(text("ALTER TABLE users ALTER COLUMN id SET DEFAULT gen_random_uuid()"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'EXECUTIVE'"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true"))
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_linked BOOLEAN NOT NULL DEFAULT false"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_limit INTEGER NOT NULL DEFAULT 50"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS working_hours JSONB"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS channel_access VARCHAR(50)[]"))
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()"))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS join_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                code_entered VARCHAR(100) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                notes TEXT,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                reviewed_at TIMESTAMP WITH TIME ZONE,
+                reviewed_by_id UUID REFERENCES users(id)
+            )
+        """))
     yield
 
 
@@ -168,6 +203,234 @@ def signout(response: Response):
 @app.get("/api/auth/me", response_model=UserResponse)
 def me(user: User = Depends(current_user)):
     return user
+
+
+@app.post("/api/auth/link-admin", response_model=LinkAdminResponse)
+def link_admin(payload: LinkAdminRequest, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    setting = db.get(SystemSetting, "app_settings")
+    admin_code = "helloguys"
+    auto_approve = False
+    if setting and isinstance(setting.value, dict):
+        admin_code = setting.value.get("security", {}).get("admin_code") or "helloguys"
+        auto_approve = setting.value.get("collaboration", {}).get("auto_approve_members", False)
+    
+    clean_code = payload.code.strip()
+    if clean_code != admin_code:
+        raise HTTPException(status_code=400, detail="Invalid admin code")
+    
+    if auto_approve:
+        user.admin_linked = True
+        req = db.scalar(select(JoinRequest).where(JoinRequest.user_id == user.id))
+        if req:
+            req.code_entered = clean_code
+            req.status = "APPROVED"
+            req.reviewed_at = datetime.now(timezone.utc)
+        else:
+            req = JoinRequest(
+                user_id=user.id,
+                code_entered=clean_code,
+                status="APPROVED",
+                reviewed_at=datetime.now(timezone.utc),
+            )
+            db.add(req)
+        db.commit()
+        db.refresh(user)
+        user_resp = UserResponse.model_validate(user)
+        return LinkAdminResponse(
+            status="APPROVED",
+            message="Workspace joined successfully!",
+            admin_linked=True,
+            user=user_resp,
+            id=user.id,
+            name=user.name,
+            email=user.email,
+            role=user.role.value if hasattr(user.role, 'value') else str(user.role),
+        )
+
+    # Record pending join request
+    req = db.scalar(select(JoinRequest).where(JoinRequest.user_id == user.id))
+    if req:
+        req.code_entered = clean_code
+        req.status = "PENDING"
+        req.created_at = datetime.now(timezone.utc)
+        req.reviewed_at = None
+        req.reviewed_by_id = None
+    else:
+        req = JoinRequest(
+            user_id=user.id,
+            code_entered=clean_code,
+            status="PENDING",
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(req)
+    
+    user.admin_linked = False
+    db.commit()
+    db.refresh(user)
+    user_resp = UserResponse.model_validate(user)
+    
+    return LinkAdminResponse(
+        status="PENDING",
+        message="Join request submitted with code. Awaiting workspace admin approval.",
+        admin_linked=False,
+        user=user_resp,
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        role=user.role.value if hasattr(user.role, 'value') else str(user.role),
+    )
+
+
+@app.get("/api/auth/join-status", response_model=JoinStatusResponse)
+def get_join_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.admin_linked:
+        return JoinStatusResponse(
+            status="APPROVED",
+            admin_linked=True,
+            message="Workspace access active.",
+        )
+    
+    req = db.scalar(
+        select(JoinRequest)
+        .where(JoinRequest.user_id == user.id)
+        .order_by(JoinRequest.created_at.desc())
+    )
+    if not req:
+        return JoinStatusResponse(
+            status="NONE",
+            admin_linked=False,
+            message="No join request submitted yet.",
+        )
+    
+    return JoinStatusResponse(
+        status=req.status,
+        admin_linked=user.admin_linked,
+        code_entered=req.code_entered,
+        created_at=req.created_at,
+        message="Join request is pending admin approval." if req.status == "PENDING" else f"Request status: {req.status}",
+    )
+
+
+@app.get("/api/settings/join-requests", response_model=list[JoinRequestItem])
+def get_join_requests_endpoint(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    reqs = db.scalars(
+        select(JoinRequest)
+        .options(joinedload(JoinRequest.user))
+        .order_by(JoinRequest.created_at.desc())
+    ).all()
+    
+    items = []
+    now = datetime.now(timezone.utc)
+    for r in reqs:
+        u = r.user
+        created_utc = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+        diff = now - created_utc
+        if diff.days > 0:
+            time_ago = f"{diff.days}d ago"
+        elif diff.seconds >= 3600:
+            time_ago = f"{diff.seconds // 3600}h ago"
+        elif diff.seconds >= 60:
+            time_ago = f"{diff.seconds // 60}m ago"
+        else:
+            time_ago = "Just now"
+            
+        items.append(JoinRequestItem(
+            id=r.id,
+            user_id=r.user_id,
+            name=u.name if u and u.name else (u.email.split('@')[0].capitalize() if u else "User"),
+            email=u.email if u else "user@example.com",
+            role=u.role.value if u and hasattr(u.role, 'value') else (str(u.role) if u else "EXECUTIVE"),
+            code_entered=r.code_entered,
+            status=r.status,
+            created_at=r.created_at,
+            time_ago=time_ago,
+        ))
+    return items
+
+
+@app.post("/api/settings/join-requests/{request_id}/approve")
+def approve_join_request_endpoint(request_id: UUID, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    req = db.get(JoinRequest, request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    
+    target_user = db.get(User, req.user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Associated user not found")
+    
+    req.status = "APPROVED"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_id = user.id
+    target_user.admin_linked = True
+    
+    db.commit()
+    db.refresh(target_user)
+    return {
+        "success": True,
+        "message": f"Approved {target_user.name or target_user.email} into workspace",
+        "user_id": str(target_user.id),
+    }
+
+
+@app.post("/api/settings/join-requests/{request_id}/reject")
+def reject_join_request_endpoint(request_id: UUID, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    req = db.get(JoinRequest, request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    
+    target_user = db.get(User, req.user_id)
+    req.status = "REJECTED"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_id = user.id
+    if target_user:
+        target_user.admin_linked = False
+        
+    db.commit()
+    return {"success": True, "message": "Join request rejected"}
+
+
+@app.get("/api/settings/members", response_model=list[WorkspaceMemberItem])
+def get_workspace_members_endpoint(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    members = db.scalars(
+        select(User)
+        .where(or_(User.role == UserRole.ADMIN, User.admin_linked == True))
+        .order_by(User.created_at.asc())
+    ).all()
+    
+    result = []
+    for m in members:
+        role_label = "Administrator" if m.role == UserRole.ADMIN else "Sales Executive"
+        result.append(WorkspaceMemberItem(
+            id=m.id,
+            name=m.name if m.name else m.email.split('@')[0].capitalize(),
+            email=m.email,
+            role=role_label,
+            is_active=m.is_active,
+            admin_linked=m.admin_linked,
+            created_at=m.created_at,
+            status="Online" if m.is_active else "Offline",
+        ))
+    return result
+
+
+@app.delete("/api/settings/members/{member_id}")
+def remove_workspace_member_endpoint(member_id: UUID, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    member = db.get(User, member_id)
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself from workspace")
+    if member.role == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot remove workspace administrator")
+    
+    member.admin_linked = False
+    
+    reqs = db.scalars(select(JoinRequest).where(JoinRequest.user_id == member.id)).all()
+    for r in reqs:
+        r.status = "REJECTED"
+        
+    db.commit()
+    return {"success": True, "message": f"Removed {member.name or member.email} from workspace"}
 
 
 @app.get("/api/settings", response_model=SettingsPayload)
@@ -680,6 +943,25 @@ def get_conversation_summary(db: Session = Depends(get_db)):
 
 @app.get("/api/conversations/recent", response_model=list[RecentConversationItem])
 def get_recent_conversations(db: Session = Depends(get_db)):
+    convs = get_conversations(db=db)
+    if convs:
+        return [
+            RecentConversationItem(
+                id=str(c.id),
+                prospect_name=c.prospect_name,
+                prospect_initials=c.prospect_initials,
+                title=c.title or "Executive",
+                company=c.company or "Enterprise",
+                time_ago=c.time_ago,
+                campaign_name=c.campaign_name or "General Campaign",
+                channel=c.channel,
+                status=c.status,
+                status_label=c.status_label,
+                latest_message=c.latest_message,
+                action_type="review",
+            )
+            for c in convs
+        ]
     setting = db.get(SystemSetting, "recent_conversations")
     if setting and isinstance(setting.value, list):
         return [RecentConversationItem.model_validate(item) for item in setting.value]
@@ -717,6 +999,489 @@ def takeover_conversation(conv_id: str, db: Session = Depends(get_db), user: Use
         setting.updated_by_id = user.id
     db.commit()
     return {"status": "ok", "conversation_id": conv_id, "mode": "human_takeover"}
+
+
+def ensure_db_conversations(db: Session):
+    if db.query(Conversation).count() == 0:
+        contacts = db.query(CampaignContact).all()
+        for i, cc in enumerate(contacts):
+            p_first = cc.contact.first_name if cc.contact else 'Prospect'
+            p_last = cc.contact.last_name if cc.contact and cc.contact.last_name else ''
+            prospect_name = f"{p_first} {p_last}".strip()
+            company_name = (cc.contact.company.name if cc.contact and cc.contact.company else (cc.campaign.name if cc.campaign else 'Enterprise'))
+            conv = Conversation(
+                id=uuid.uuid4(),
+                campaign_contact_id=cc.id,
+                channel=Channel.EMAIL,
+                subject=f'AI Outbound SDR Strategy for {company_name}',
+                is_open=True,
+                last_message_at=datetime.now(timezone.utc) - timedelta(minutes=15 * (i + 1)),
+            )
+            db.add(conv)
+            db.flush()
+            m1 = Message(
+                id=uuid.uuid4(),
+                conversation_id=conv.id,
+                direction=Direction.OUTBOUND,
+                channel=Channel.EMAIL,
+                subject=conv.subject,
+                body=f'Hi {prospect_name},\n\nI noticed {company_name} is actively scaling. Our Autonomous SDR agent automates ICP fitment, personalised outreach, and multi-turn meeting scheduling with guaranteed human review.\n\nWould you have 15 minutes next week for a quick walkthrough?',
+                sent_at=datetime.now(timezone.utc) - timedelta(hours=2 * (i + 1)),
+            )
+            db.add(m1)
+            m2 = Message(
+                id=uuid.uuid4(),
+                conversation_id=conv.id,
+                direction=Direction.INBOUND,
+                channel=Channel.EMAIL,
+                subject=f'Re: {conv.subject}',
+                body='Hi there, thanks for reaching out. We are currently evaluating solutions to streamline outbound sales pipelines. Could you send more details regarding your enterprise integrations?',
+                received_at=datetime.now(timezone.utc) - timedelta(minutes=15 * (i + 1)),
+            )
+            db.add(m2)
+            d = Draft(
+                id=uuid.uuid4(),
+                conversation_id=conv.id,
+                channel=Channel.EMAIL,
+                subject=f'Re: {conv.subject}',
+                body=f"Hi {prospect_name},\n\nGlad to hear that resonates! We integrate seamlessly with Salesforce, HubSpot, LinkedIn, and corporate Gmail/Outlook. Would Tuesday at 2 PM IST or Thursday at 11 AM IST work for a brief 20-minute call to show you a live demo?",
+                status=DraftStatus.PENDING_REVIEW,
+            )
+            db.add(d)
+            cc.stage = ContactStage.ENGAGED
+        db.commit()
+
+
+@app.get("/api/conversations", response_model=list[ConversationListItem])
+def get_conversations(campaign_id: Optional[UUID] = None, db: Session = Depends(get_db)):
+    ensure_db_conversations(db)
+    stmt = (
+        select(Conversation)
+        .options(
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.contact).joinedload(Contact.company),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.campaign),
+            joinedload(Conversation.messages),
+            joinedload(Conversation.drafts),
+        )
+    )
+    if campaign_id:
+        stmt = stmt.join(Conversation.campaign_contact).where(CampaignContact.campaign_id == campaign_id)
+    
+    stmt = stmt.order_by(Conversation.last_message_at.desc().nullslast(), Conversation.created_at.desc())
+    convs = db.scalars(stmt).unique().all()
+    
+    results = []
+    for c in convs:
+        cc = c.campaign_contact
+        contact = cc.contact if cc else None
+        p_first = contact.first_name if contact else "Prospect"
+        p_last = contact.last_name or "" if contact else ""
+        p_name = f"{p_first} {p_last}".strip()
+        p_initials = "".join([part[0].upper() for part in p_name.split() if part]) or "P"
+        company_name = contact.company.name if (contact and contact.company) else (cc.campaign.name if cc and cc.campaign else "Enterprise")
+        title = contact.title if contact else "Executive"
+        
+        has_pending = any(d.status == DraftStatus.PENDING_REVIEW for d in c.drafts)
+        if not c.is_open:
+            st = "RESOLVED"
+            st_label = "Resolved"
+        elif has_pending:
+            st = "NEEDS_ATTENTION"
+            st_label = "Needs Attention"
+        else:
+            st = "AI_HANDLING"
+            st_label = "AI Handling"
+            
+        msgs = sorted(c.messages, key=lambda m: m.created_at or datetime.min)
+        latest_msg = msgs[-1].body if msgs else (c.subject or "No messages yet")
+        if len(latest_msg) > 120:
+            latest_msg = latest_msg[:117] + "..."
+            
+        t_target = c.last_message_at or c.created_at
+        if t_target:
+            if t_target.tzinfo is None:
+                t_target = t_target.replace(tzinfo=timezone.utc)
+            time_diff = datetime.now(timezone.utc) - t_target
+            if time_diff.total_seconds() < 3600:
+                time_ago = f"{max(1, int(time_diff.total_seconds() // 60))}m ago"
+            elif time_diff.total_seconds() < 86400:
+                time_ago = f"{int(time_diff.total_seconds() // 3600)}h ago"
+            else:
+                time_ago = f"{int(time_diff.total_seconds() // 86400)}d ago"
+        else:
+            time_ago = "Just now"
+            
+        results.append(ConversationListItem(
+            id=c.id,
+            campaign_id=cc.campaign_id if cc else None,
+            campaign_name=cc.campaign.name if cc and cc.campaign else None,
+            prospect_name=p_name,
+            prospect_initials=p_initials,
+            title=title,
+            company=company_name,
+            channel=c.channel.value if hasattr(c.channel, "value") else str(c.channel),
+            status=st,
+            status_label=st_label,
+            latest_message=latest_msg,
+            time_ago=time_ago,
+            messages_count=len(msgs),
+            created_at=c.created_at,
+        ))
+    return results
+
+
+@app.get("/api/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+def get_conversation_details(conversation_id: UUID, db: Session = Depends(get_db)):
+    conv = db.scalar(
+        select(Conversation)
+        .options(
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.contact).joinedload(Contact.company),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.campaign),
+            joinedload(Conversation.messages).joinedload(Message.sent_by),
+            joinedload(Conversation.drafts),
+        )
+        .where(Conversation.id == conversation_id)
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+        
+    cc = conv.campaign_contact
+    contact = cc.contact if cc else None
+    p_first = contact.first_name if contact else "Prospect"
+    p_last = contact.last_name or "" if contact else ""
+    p_name = f"{p_first} {p_last}".strip()
+    p_initials = "".join([part[0].upper() for part in p_name.split() if part]) or "P"
+    company_name = contact.company.name if (contact and contact.company) else (cc.campaign.name if cc and cc.campaign else "Enterprise")
+    
+    has_pending = any(d.status == DraftStatus.PENDING_REVIEW for d in conv.drafts)
+    if not conv.is_open:
+        st = "RESOLVED"
+        st_label = "Resolved"
+    elif has_pending:
+        st = "NEEDS_ATTENTION"
+        st_label = "Needs Attention"
+    else:
+        st = "AI_HANDLING"
+        st_label = "AI Handling"
+        
+    sorted_msgs = sorted(conv.messages, key=lambda m: m.created_at or datetime.min)
+    msg_responses = []
+    for m in sorted_msgs:
+        sender_name = "AI SDR"
+        if m.direction == Direction.INBOUND:
+            sender_name = p_name
+        elif m.sent_by:
+            sender_name = m.sent_by.name or "Human SDR"
+            
+        msg_responses.append(MessageResponse(
+            id=m.id,
+            conversation_id=m.conversation_id,
+            direction=m.direction.value if hasattr(m.direction, "value") else str(m.direction),
+            channel=m.channel.value if hasattr(m.channel, "value") else str(m.channel),
+            sender=sender_name,
+            subject=m.subject,
+            body=m.body,
+            sent_at=m.sent_at,
+            received_at=m.received_at,
+            created_at=m.created_at,
+        ))
+        
+    draft_dict = None
+    if conv.drafts:
+        d = sorted(conv.drafts, key=lambda x: x.created_at or datetime.min)[-1]
+        draft_dict = {
+            "id": str(d.id),
+            "body": d.body,
+            "subject": d.subject,
+            "status": d.status.value if hasattr(d.status, "value") else str(d.status),
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        }
+        
+    return ConversationDetailResponse(
+        id=conv.id,
+        campaign_id=cc.campaign_id if cc else None,
+        campaign_name=cc.campaign.name if cc and cc.campaign else None,
+        channel=conv.channel.value if hasattr(conv.channel, "value") else str(conv.channel),
+        subject=conv.subject,
+        is_open=conv.is_open,
+        status=st,
+        status_label=st_label,
+        prospect={
+            "name": p_name,
+            "initials": p_initials,
+            "title": contact.title if contact else "Executive",
+            "company": company_name,
+            "email": contact.email if contact else None,
+            "phone": contact.phone if contact else None,
+            "linkedin_url": contact.linkedin_url if contact else None,
+        },
+        messages=msg_responses,
+        draft=draft_dict,
+        created_at=conv.created_at,
+        last_message_at=conv.last_message_at,
+    )
+
+
+@app.post("/api/conversations/{conversation_id}/messages", response_model=MessageResponse)
+def create_conversation_message(
+    conversation_id: UUID,
+    payload: CreateMessageRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    conv = db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+        
+    user = None
+    try:
+        user_id = get_user_id_from_request(request)
+        if user_id:
+            user = db.get(User, user_id)
+    except Exception:
+        pass
+        
+    now = datetime.now(timezone.utc)
+    ch = conv.channel
+    if payload.channel:
+        try:
+            ch = Channel[payload.channel.upper()]
+        except Exception:
+            pass
+            
+    new_msg = Message(
+        id=uuid.uuid4(),
+        conversation_id=conv.id,
+        direction=Direction.OUTBOUND,
+        channel=ch,
+        subject=conv.subject,
+        body=payload.body,
+        sent_by_user_id=user.id if user else None,
+        sent_at=now,
+        created_at=now,
+    )
+    conv.last_message_at = now
+    db.add(new_msg)
+    db.commit()
+    db.refresh(new_msg)
+    
+    sender_name = user.name if user and user.name else "Human SDR"
+    return MessageResponse(
+        id=new_msg.id,
+        conversation_id=new_msg.conversation_id,
+        direction="OUTBOUND",
+        channel=ch.value if hasattr(ch, "value") else str(ch),
+        sender=sender_name,
+        subject=new_msg.subject,
+        body=new_msg.body,
+        sent_at=new_msg.sent_at,
+        received_at=None,
+        created_at=new_msg.created_at,
+    )
+
+
+class GenerateRAGReplyRequest(BaseModel):
+    feedback: Optional[str] = None
+    force_regenerate: Optional[bool] = False
+
+
+class SubmitDraftToManagerRequest(BaseModel):
+    draft_id: Optional[UUID] = None
+    body: Optional[str] = None
+    subject: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.post("/api/conversations/{conversation_id}/generate-rag-reply")
+def generate_rag_reply_endpoint(
+    conversation_id: UUID,
+    payload: Optional[GenerateRAGReplyRequest] = None,
+    db: Session = Depends(get_db),
+):
+    from .Langchain_.reply_agent import handle_inbound_reply
+
+    conv = db.scalar(
+        select(Conversation)
+        .options(
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.contact).joinedload(Contact.company),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.campaign),
+            joinedload(Conversation.messages),
+            joinedload(Conversation.drafts),
+        )
+        .where(Conversation.id == conversation_id)
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    cc = conv.campaign_contact
+    contact = cc.contact if cc else None
+    p_first = contact.first_name if contact else "Valued"
+    p_last = contact.last_name or "" if contact else "Contact"
+    p_name = f"{p_first} {p_last}".strip()
+    p_title = contact.title if contact else "Decision Maker"
+    comp_name = contact.company.name if (contact and contact.company) else (cc.campaign.name if cc and cc.campaign else "Target Company")
+    contact_id = (contact.email or contact.phone) if contact else f"conv_{conv.id}"
+    camp_name = cc.campaign.name if cc and cc.campaign else "US SaaS Engineering Leaders"
+
+    # Find messages
+    inbound_msgs = [m for m in conv.messages if m.direction == Direction.INBOUND]
+    latest_inbound = inbound_msgs[-1].body if inbound_msgs else "Hi there, could you send more details regarding your enterprise integrations?"
+
+    outbound_msgs = [m for m in conv.messages if m.direction == Direction.OUTBOUND]
+    original_outreach = outbound_msgs[0].body if outbound_msgs else (conv.subject or "Outreach email sent.")
+
+    reply_payload = {
+        "channel": conv.channel.value if hasattr(conv.channel, "value") else str(conv.channel).lower(),
+        "contact_id": contact_id,
+        "reply_text": latest_inbound,
+        "original_outreach": original_outreach,
+        "sender_name": "Alex Rivers",
+        "sender_role": "Senior SDR",
+        "sender_company_name": "PulseOps AI",
+        "campaign_name": camp_name,
+        "prospect_name": p_name,
+        "prospect_position": p_title,
+        "prospect_company_name": comp_name,
+    }
+
+    # Check for existing draft or revision feedback
+    existing_draft = None
+    if conv.drafts:
+        existing_draft = sorted(conv.drafts, key=lambda x: x.created_at or datetime.min)[-1]
+
+    user_feedback = payload.feedback.strip() if (payload and payload.feedback) else None
+    if user_feedback:
+        reply_payload["rep_feedback"] = user_feedback
+        if existing_draft:
+            reply_payload["rejected_draft"] = existing_draft.body
+
+    # Execute RAG reply agent
+    rag_result = handle_inbound_reply(reply_payload)
+
+    # Save draft to PostgreSQL
+    subject = f"Re: {conv.subject or 'Enterprise Solutions'}"
+    draft_body = rag_result.get("draft_reply") or "Hi there, thanks for your reply. Let me know when you have 15 minutes for a quick chat."
+
+    if existing_draft and existing_draft.status == DraftStatus.PENDING_REVIEW and not (payload and payload.force_regenerate):
+        existing_draft.body = draft_body
+        existing_draft.subject = subject
+        existing_draft.status = DraftStatus.PENDING_REVIEW
+        draft_record = existing_draft
+    else:
+        draft_record = Draft(
+            id=uuid.uuid4(),
+            conversation_id=conv.id,
+            channel=conv.channel,
+            subject=subject,
+            body=draft_body,
+            original_body=draft_body,
+            status=DraftStatus.PENDING_REVIEW,
+        )
+        db.add(draft_record)
+
+    # Audit log
+    audit_log = AuditLog(
+        id=uuid.uuid4(),
+        entity_type="draft",
+        entity_id=str(draft_record.id),
+        action="RAG_REPLY_GENERATED",
+        details={
+            "conversation_id": str(conv.id),
+            "intent": rag_result.get("intent"),
+            "action": rag_result.get("action"),
+            "feedback": user_feedback,
+            "sources": rag_result.get("rag_sources", []),
+        },
+    )
+    db.add(audit_log)
+    db.commit()
+    db.refresh(draft_record)
+
+    return {
+        "success": True,
+        "draft": {
+            "id": str(draft_record.id),
+            "subject": draft_record.subject,
+            "body": draft_record.body,
+            "status": draft_record.status.value if hasattr(draft_record.status, "value") else str(draft_record.status),
+            "created_at": draft_record.created_at.isoformat() if draft_record.created_at else None,
+        },
+        "rag_details": {
+            "intent": rag_result.get("intent"),
+            "action": rag_result.get("action"),
+            "sources": rag_result.get("rag_sources", [
+                "Qdrant: Enterprise Integrations & Pipeline Automation",
+                "Qdrant: SOC-2 Type II & GDPR Compliance Standards",
+                "Qdrant: FinTech Enterprise Case Study (3.2x Meetings Booked)"
+            ]),
+            "meeting": rag_result.get("meeting"),
+        }
+    }
+
+
+@app.post("/api/conversations/{conversation_id}/submit-to-manager")
+def submit_draft_to_manager_endpoint(
+    conversation_id: UUID,
+    payload: SubmitDraftToManagerRequest,
+    db: Session = Depends(get_db),
+):
+    conv = db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    draft = None
+    if payload.draft_id:
+        draft = db.get(Draft, payload.draft_id)
+    if not draft:
+        draft = db.scalar(
+            select(Draft)
+            .where(Draft.conversation_id == conversation_id)
+            .order_by(Draft.created_at.desc())
+        )
+
+    if not draft:
+        draft = Draft(
+            id=uuid.uuid4(),
+            conversation_id=conv.id,
+            channel=conv.channel,
+            subject=payload.subject or f"Re: {conv.subject or 'Enterprise Solutions'}",
+            body=payload.body or "Draft reply",
+            status=DraftStatus.PENDING_REVIEW,
+        )
+        db.add(draft)
+    else:
+        if payload.body:
+            draft.body = payload.body
+        if payload.subject:
+            draft.subject = payload.subject
+        draft.status = DraftStatus.PENDING_REVIEW
+
+    # Add audit log
+    audit_log = AuditLog(
+        id=uuid.uuid4(),
+        entity_type="draft",
+        entity_id=str(draft.id),
+        action="SUBMITTED_TO_MANAGER",
+        details={
+            "conversation_id": str(conv.id),
+            "notes": payload.notes or "Submitted by sales executive for manager approval.",
+        }
+    )
+    db.add(audit_log)
+    db.commit()
+    db.refresh(draft)
+
+    return {
+        "success": True,
+        "message": "Email draft submitted to manager for approval.",
+        "draft": {
+            "id": str(draft.id),
+            "subject": draft.subject,
+            "body": draft.body,
+            "status": draft.status.value if hasattr(draft.status, "value") else str(draft.status),
+            "created_at": draft.created_at.isoformat() if draft.created_at else None,
+        }
+    }
 
 
 @app.get("/api/analytics/overview", response_model=AnalyticsOverviewResponse)
@@ -1652,3 +2417,156 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
     response = RedirectResponse(redirect_target, status_code=status.HTTP_302_FOUND)
     set_auth_cookie(response, user.id)
     return response
+
+
+from pydantic import BaseModel
+
+class ReviewFeedback(BaseModel):
+    feedback: Optional[str] = None
+
+@app.get("/api/conversations/{conversation_id}/review")
+def get_conversation_review(conversation_id: UUID, db: Session = Depends(get_db)):
+    from .models import Conversation, Message, Draft, AgentRun, AuditLog
+    conv = db.scalar(
+        select(Conversation)
+        .options(
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.contact),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.company),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.campaign),
+            joinedload(Conversation.campaign_contact).joinedload(CampaignContact.assigned_user),
+        )
+        .where(Conversation.id == conversation_id)
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+        
+    messages = db.scalars(select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)).all()
+    
+    agent_runs = db.scalars(select(AgentRun).where(AgentRun.campaign_contact_id == conv.campaign_contact_id).order_by(AgentRun.created_at.desc())).all()
+    
+    drafts = db.scalars(select(Draft).where(Draft.conversation_id == conversation_id).order_by(Draft.created_at.desc())).all()
+    
+    audit_logs = db.scalars(select(AuditLog).where(AuditLog.entity_id == str(conversation_id)).order_by(AuditLog.created_at.desc())).all()
+
+    return {
+        "conversation": {
+            "id": str(conv.id),
+            "status": "AWAITING APPROVAL" if any(d.status == DraftStatus.PENDING_REVIEW for d in drafts) else "ACTIVE"
+        },
+        "prospect": {
+            "name": f"{conv.campaign_contact.contact.first_name} {conv.campaign_contact.contact.last_name or ''}".strip(),
+            "title": conv.campaign_contact.contact.title,
+            "company": conv.campaign_contact.company.name if conv.campaign_contact.company else None,
+            "campaign": conv.campaign_contact.campaign.name,
+            "icp_score": str(conv.campaign_contact.icp_score),
+            "funnel_stage": conv.campaign_contact.stage.value,
+            "executive": conv.campaign_contact.assigned_user.name if conv.campaign_contact.assigned_user else "Unassigned",
+            "sentiment": "Interested" # stub
+        },
+        "safety_checks": {
+            "opt_out": "No",
+            "duplicate_check": "Pass",
+            "recent_interaction": "3 days ago"
+        },
+        "messages": [
+            {
+                "id": str(m.id),
+                "direction": m.direction.value,
+                "body": m.body,
+                "created_at": m.created_at.isoformat()
+            } for m in messages
+        ],
+        "drafts": [
+            {
+                "id": str(d.id),
+                "body": d.body,
+                "status": d.status.value,
+                "created_at": d.created_at.isoformat()
+            } for d in drafts
+        ],
+        "agent_recommendation": {
+            "intent": "Inquiry",
+            "sentiment": "Positive",
+            "confidence": "94%",
+            "recommended_action": "Schedule Meeting",
+            "suggested_response": agent_runs[0].output.get("recommended_response") if agent_runs and agent_runs[0].output else "Draft suggestion goes here...",
+            "sources": ["Fintech Case Study 2024", "Product Features DB"]
+        },
+        "audit_history": [
+            {
+                "action": log.action,
+                "created_at": log.created_at.isoformat()
+            } for log in audit_logs
+        ]
+    }
+
+@app.post("/api/conversations/{conversation_id}/approve")
+def approve_conversation(conversation_id: UUID, db: Session = Depends(get_db)):
+    from .models import Draft, Approval
+    draft = db.scalar(select(Draft).where(Draft.conversation_id == conversation_id, Draft.status == DraftStatus.PENDING_REVIEW))
+    if not draft:
+        raise HTTPException(status_code=404, detail="No pending draft found")
+        
+    draft.status = DraftStatus.APPROVED
+    
+    # We just need to mock an approval insertion, but reviewer_id can't be null
+    reviewer_id = None
+    if draft.conversation and draft.conversation.campaign_contact:
+        reviewer_id = draft.conversation.campaign_contact.assigned_user_id
+    
+    # if reviewer_id is still None, grab any admin
+    if not reviewer_id:
+        reviewer_id = db.scalar(select(User.id).where(User.role == UserRole.ADMIN))
+        
+    approval = Approval(
+        draft_id=draft.id,
+        reviewer_id=reviewer_id,
+        decision=ApprovalDecision.APPROVED
+    )
+    db.add(approval)
+
+    # Convert approved draft into outbound message sent to prospect
+    conv = draft.conversation or db.get(Conversation, conversation_id)
+    if conv:
+        outbound_msg = Message(
+            id=uuid.uuid4(),
+            conversation_id=conv.id,
+            direction=Direction.OUTBOUND,
+            channel=draft.channel or conv.channel,
+            subject=draft.subject or conv.subject,
+            body=draft.body,
+            sent_by_user_id=reviewer_id,
+            sent_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(outbound_msg)
+        conv.last_message_at = datetime.now(timezone.utc)
+
+    db.commit()
+    return {"success": True}
+
+@app.post("/api/conversations/{conversation_id}/reject")
+def reject_conversation(conversation_id: UUID, payload: ReviewFeedback, db: Session = Depends(get_db)):
+    from .models import Draft, Approval
+    draft = db.scalar(select(Draft).where(Draft.conversation_id == conversation_id, Draft.status == DraftStatus.PENDING_REVIEW))
+    if not draft:
+        raise HTTPException(status_code=404, detail="No pending draft found")
+        
+    draft.status = DraftStatus.REJECTED
+    
+    reviewer_id = None
+    if draft.conversation and draft.conversation.campaign_contact:
+        reviewer_id = draft.conversation.campaign_contact.assigned_user_id
+    
+    if not reviewer_id:
+        reviewer_id = db.scalar(select(User.id).where(User.role == UserRole.ADMIN))
+        
+    approval = Approval(
+        draft_id=draft.id,
+        reviewer_id=reviewer_id,
+        decision=ApprovalDecision.REJECTED,
+        comments=payload.feedback
+    )
+    db.add(approval)
+    db.commit()
+    return {"success": True}

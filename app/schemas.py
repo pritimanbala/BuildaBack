@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field
@@ -21,6 +22,7 @@ class UserResponse(BaseModel):
     name: str | None
     role: str
     is_active: bool = True
+    admin_linked: bool = False
     daily_limit: int = 50
     access_token: Optional[str] = None
     token_type: Optional[str] = "bearer"
@@ -59,6 +61,60 @@ class PermissionsSettings(BaseModel):
 class SecuritySettings(BaseModel):
     two_factor_auth: bool = False
     session_timeout_minutes: int = 60
+    admin_code: Optional[str] = "helloguys"
+
+
+class CollaborationSettings(BaseModel):
+    auto_approve_members: bool = False
+    invite_code_expiry_days: int = 7
+
+
+class LinkAdminRequest(BaseModel):
+    code: str
+
+
+class LinkAdminResponse(BaseModel):
+    status: str = "PENDING"
+    message: str = "Join request submitted. Awaiting admin approval."
+    admin_linked: bool = False
+    user: Optional[UserResponse] = None
+    id: Optional[UUID] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+
+
+class JoinStatusResponse(BaseModel):
+    status: str
+    admin_linked: bool
+    code_entered: Optional[str] = None
+    created_at: Optional[datetime] = None
+    message: Optional[str] = None
+
+
+class JoinRequestItem(BaseModel):
+    id: UUID
+    user_id: UUID
+    name: Optional[str] = ""
+    email: str
+    role: str
+    code_entered: str
+    status: str
+    created_at: datetime
+    time_ago: Optional[str] = None
+    model_config = {"from_attributes": True}
+
+
+class WorkspaceMemberItem(BaseModel):
+    id: UUID
+    name: Optional[str] = ""
+    email: str
+    role: str
+    is_active: bool = True
+    admin_linked: bool = True
+    created_at: datetime
+    status: str = "Online"
+    model_config = {"from_attributes": True}
 
 
 class SettingsPayload(BaseModel):
@@ -68,6 +124,7 @@ class SettingsPayload(BaseModel):
     integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
     permissions: PermissionsSettings = Field(default_factory=PermissionsSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    collaboration: CollaborationSettings = Field(default_factory=CollaborationSettings)
 
 
 class ConversationSummary(BaseModel):
@@ -99,6 +156,61 @@ class EscalationItem(BaseModel):
     campaign_name: str
     reason: str
     status: str
+
+
+class MessageResponse(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    direction: str
+    channel: str
+    sender: str
+    subject: Optional[str] = None
+    body: str
+    sent_at: Optional[datetime] = None
+    received_at: Optional[datetime] = None
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class CreateMessageRequest(BaseModel):
+    body: str
+    channel: Optional[str] = None
+
+
+class ConversationListItem(BaseModel):
+    id: UUID
+    campaign_id: Optional[UUID] = None
+    campaign_name: Optional[str] = None
+    prospect_name: str
+    prospect_initials: str
+    title: Optional[str] = None
+    company: Optional[str] = None
+    channel: str
+    status: str
+    status_label: str
+    latest_message: str
+    time_ago: str
+    messages_count: int = 0
+    created_at: Optional[datetime] = None
+    model_config = {"from_attributes": True}
+
+
+class ConversationDetailResponse(BaseModel):
+    id: UUID
+    campaign_id: Optional[UUID] = None
+    campaign_name: Optional[str] = None
+    channel: str
+    subject: Optional[str] = None
+    is_open: bool = True
+    status: str
+    status_label: str
+    prospect: dict
+    messages: list[MessageResponse]
+    draft: Optional[dict] = None
+    created_at: datetime
+    last_message_at: Optional[datetime] = None
+    model_config = {"from_attributes": True}
+
 
 
 class CampaignCreate(BaseModel):
