@@ -6,7 +6,7 @@ pydantic-settings==2.9.1
 PyJWT==2.10.1
 pwdlib[argon2]==0.2.1
 email-validator==2.2.0
-strawberry-graphql[fastapi]==0.283.1
+strawberry-graphql[fastapi]==0.327.7
 authlib==1.6.0
 httpx==0.28.1
 itsdangerous==2.2.0
